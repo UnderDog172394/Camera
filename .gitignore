@@ -9,6 +9,7 @@ works.txt
 StreamtoWEB.txt
 sdkconfig.defaults
 workspace.code-workspace
+.gitignore
 
 # IDE-specific files
 .vscode/
