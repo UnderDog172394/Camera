@@ -1,0 +1,14 @@
+# ESP-IDF build output
+build/
+dist/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+works.txt
+StreamtoWEB.txt
+sdkconfig.defaults
+workspace.code-workspace
+
+# IDE-specific files
+.vscode/
