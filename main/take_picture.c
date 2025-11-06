@@ -1,512 +1,421 @@
+// ESP32-CAM FAST detector with STA->SoftAP fallback (ESP-IDF)
+// - Grayscale + FAST-12 + O(W*H) grid NMS + black 3x3 markers
+// - Stream tuning via URL: /stream?t=40&q=60  (threshold & JPEG quality)
+// - Tries STA ~10s, else SoftAP "ESP32-CAM-XXXXXX" / "12345678"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+
 #include "esp_system.h"
 #include "esp_log.h"
-#include "esp_camera.h"
-#include "esp_heap_caps.h" // For PSRAM (heap_caps_malloc)
-
-// Includes for Wi-Fi and Web Server
-#include "nvs_flash.h"
-#include "esp_netif.h"
+#include "esp_err.h"
 #include "esp_event.h"
+#include "esp_netif.h"
 #include "esp_wifi.h"
+#include "nvs_flash.h"
+
+#include "esp_camera.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"          // <-- needed for esp_timer_get_time()
 
-// --- Wi-Fi Configuration ---
-// Set these to your network credentials
-#define WIFI_SSID      "Jordan's Wifi"
-#define WIFI_PASS      "Under_Dog-172"
-// ----------------------------
+// ======================== CONFIG ========================
+#define WIFI_SSID "YOUR_WIFI_SSID"     // 2.4 GHz only
+#define WIFI_PASS "YOUR_WIFI_PASSWORD"
+// ========================================================
 
+// =================== ESP32-CAM (AI-Thinker) PINS ===================
+#define CAM_PIN_PWDN    32
+#define CAM_PIN_RESET   -1
+#define CAM_PIN_XCLK     0
+#define CAM_PIN_SIOD    26 // SCCB SDA
+#define CAM_PIN_SIOC    27 // SCCB SCL
+#define CAM_PIN_D7      35
+#define CAM_PIN_D6      34
+#define CAM_PIN_D5      39
+#define CAM_PIN_D4      36
+#define CAM_PIN_D3      21
+#define CAM_PIN_D2      19
+#define CAM_PIN_D1      18
+#define CAM_PIN_D0       5
+#define CAM_PIN_VSYNC   25
+#define CAM_PIN_HREF    23
+#define CAM_PIN_PCLK    22
 
-// Pin definitions for ESP32-CAM (AI-Thinker module)
-#define CAM_PIN_PWDN    32 // Power down pin, enable camera
-#define CAM_PIN_RESET   -1 // Software reset (not used)
-#define CAM_PIN_XCLK    0  // XCLK output (to sensor)
-#define CAM_PIN_SIOD    26 // I2C SDA
-#define CAM_PIN_SIOC    27 // I2C SCL
-#define CAM_PIN_D7      35 // Y9 data bit
-#define CAM_PIN_D6      34 // Y8 data bit
-#define CAM_PIN_D5      39 // Y7 data bit
-#define CAM_PIN_D4      36 // Y6 data bit
-#define CAM_PIN_D3      21 // Y5 data bit
-#define CAM_PIN_D2      19 // Y4 data bit
-#define CAM_PIN_D1      18 // Y3 data bit
-#define CAM_PIN_D0      5  // Y2 data bit
-#define CAM_PIN_VSYNC   25 // VSYNC signal
-#define CAM_PIN_HREF    23 // HREF signal
-#define CAM_PIN_PCLK    22 // Pixel clock signal
+// ==================== FAST params ====================
+#define FAST_MIN_CONTIG   12             // FAST-12
+#define MAX_KEYPOINTS     512            // after NMS
+static int g_fast_threshold = 40;        // runtime-tunable via URL
 
-// FAST algorithm parameters and buffer sizes
-#define FAST_THRESHOLD   40     // Intensity threshold (t) for FAST corner detection
-#define FAST_MIN_CONTIG  12     // Require 12 contiguous pixels on circle (FAST-12)
-#define MAX_KEYPOINTS    2048   // Maximum number of keypoints to detect/store
-
-// Data structure for a keypoint (similar to OpenCV KeyPoint x,y,score)
 typedef struct {
-    uint16_t x;
-    uint16_t y;
-    uint16_t score;
+    uint16_t x, y, score;
 } Keypoint;
 
-// Static buffers for image processing
-static Keypoint keypoints[MAX_KEYPOINTS];
-static bool suppressed_arr[MAX_KEYPOINTS];
+static Keypoint  keypoints[MAX_KEYPOINTS];
+static uint16_t *score_grid = NULL;      // PSRAM: w*h grid of scores
 
-// Global buffer for grayscale image (will be allocated in PSRAM)
-static uint8_t *gray_buf = NULL;
-static int img_width = 0;
-static int img_height = 0;
+static int g_w = 0, g_h = 0;
 
-static const char *TAG_CAM = "CAM";
-static const char *TAG_WIFI = "WIFI";
-static const char *TAG_SRV = "HTTP";
-static const char *TAG_FAST = "FAST";
+static const char *TAG = "CAM_HTTP";
+static const int WIFI_CONNECTED_BIT = BIT0;
+static EventGroupHandle_t s_wifi_event_group;
 
-// MJPEG streaming boundary
+// ==================== MJPEG bits ====================
 #define PART_BOUNDARY "123456789000000000000987654321"
-static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *STREAM_BOUNDARY     = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *STREAM_PART_HDR     = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-
-// Comparator for qsort: sort keypoints by score in descending order (higher score first)
-static int compare_keypoints_desc(const void *a, const void *b) {
-    const Keypoint *ka = (const Keypoint *)a;
-    const Keypoint *kb = (const Keypoint *)b;
-    if (ka->score < kb->score) return 1;
-    if (ka->score > kb->score) return -1;
-    return 0;
-}
-
-/**
- * @brief Extracts the Y (luminance) channel from a YUV422 frame
- */
-static void extract_grayscale(camera_fb_t *fb) {
-    if (!gray_buf) return;
-    
-    size_t len = fb->len;
-    size_t gray_index = 0;
-    for (size_t i = 0; i < len; i += 2) {
-        gray_buf[gray_index++] = fb->buf[i];
-    }
-}
-
-/**
- * @brief Draws the detected keypoints onto the YUV422 frame buffer
- */
-static void draw_keypoints(camera_fb_t *fb, Keypoint *kps, int num_kp) {
-    if (!fb || !kps) return;
-
-    // Draw a 3x3 white square for each keypoint
-    for (int i = 0; i < num_kp; ++i) {
-        int x = kps[i].x;
-        int y = kps[i].y;
-
+// ==================== FAST helpers ====================
+static inline void draw_keypoints_gray(camera_fb_t *fb, const Keypoint *kps, int n) {
+    uint8_t *buf = fb->buf;
+    const int w = fb->width, h = fb->height;
+    for (int i = 0; i < n; ++i) {
+        const int x = kps[i].x, y = kps[i].y;
         for (int dy = -1; dy <= 1; ++dy) {
+            const int yy = y + dy; if ((unsigned)yy >= (unsigned)h) continue;
             for (int dx = -1; dx <= 1; ++dx) {
-                int px = x + dx;
-                int py = y + dy;
-                // Check bounds
-                if (px >= 0 && px < fb->width && py >= 0 && py < fb->height) {
-                    // Calculate the index for the Y byte in the YUV422 buffer
-                    // YUV422 format: [Y0, U0, Y1, V0], [Y2, U1, Y3, V1], ...
-                    // Index of Y for pixel (px, py) is (py * width * 2) + (px * 2)
-                    size_t y_index = (py * fb->width + px) * 2;
-                    fb->buf[y_index] = 255; // Set Luminance (Y) to max (white)
-                }
+                const int xx = x + dx; if ((unsigned)xx >= (unsigned)w) continue;
+                buf[yy * w + xx] = 0; // black dot for visibility
             }
         }
     }
 }
 
+// FAST-12 detect into score_grid + 3x3 local-max NMS (O(W*H))
+static void fast_detect_and_nms(const uint8_t *img, int w, int h, int *out_count) {
+    if (!score_grid) { *out_count = 0; return; }
+    memset(score_grid, 0, w * h * sizeof(uint16_t));
 
-/**
- * @brief Runs FAST-12 detection, qsort, and NMS on the global gray_buf
- * @param out_num_kp Pointer to store the final number of keypoints
- */
-static void run_fast_and_nms(int *out_num_kp) {
-    uint8_t *image = gray_buf;
-    int width = img_width;
-    int height = img_height;
-    int threshold = FAST_THRESHOLD;
-    int num_kp = 0;
+    const int t = g_fast_threshold;
+    const int8_t ox[16] = { 0,  1,  2,  3,  3,  3,  2,  1,  0, -1, -2, -3, -3, -3, -2, -1 };
+    const int8_t oy[16] = { 3,  3,  2,  1,  0, -1, -2, -3, -3, -3, -2, -1,  0,  1,  2,  3 };
+    const int qi[4]     = { 1, 5, 9, 13 };
 
-    const int8_t offset_x[16] = {  0,  1,  2,  3,  3,  3,  2,  1,  0, -1, -2, -3, -3, -3, -2, -1 };
-    const int8_t offset_y[16] = {  3,  3,  2,  1,  0, -1, -2, -3, -3, -3, -2, -1,  0,  1,  2,  3 };
+    // Detect
+    for (int y = 3; y < h - 3; ++y) {
+        const int yw = y * w;
+        for (int x = 3; x < w - 3; ++x) {
+            const uint8_t p = img[yw + x];
+            const int hi = (p + t > 255) ? 255 : (p + t);
+            const int lo = (p - t <   0) ?   0 : (p - t);
 
-    for (int y = 3; y < height - 3; ++y) {
-        for (int x = 3; x < width - 3; ++x) {
-            uint8_t I_p = image[y * width + x];
-            uint8_t I_p_t_high = (uint8_t)((I_p + threshold) > 255 ? 255 : I_p + threshold);
-            uint8_t I_p_t_low  = (uint8_t)((I_p < threshold) ? 0 : I_p - threshold);
-
-            int bright = 0;
-            int dark = 0;
-            const int sample_idx[4] = {1, 5, 9, 13};
+            // quick test on 1,5,9,13
+            int bright = 0, dark = 0;
             for (int k = 0; k < 4; ++k) {
-                int idx = sample_idx[k];
-                uint8_t val = image[(y + offset_y[idx]) * width + (x + offset_x[idx])];
-                if (val > I_p_t_high) bright++;
-                if (val < I_p_t_low)  dark++;
+                const int idx = qi[k];
+                const uint8_t v = img[(y + oy[idx]) * w + (x + ox[idx])];
+                bright += (v > hi);
+                dark   += (v < lo);
             }
-            if (bright < 3 && dark < 3) {
-                continue;
-            }
+            if (bright < 3 && dark < 3) continue;
 
-            bool is_corner = false;
-            for (int start = 0; start < 16; ++start) {
-                if (image[(y + offset_y[start]) * width + (x + offset_x[start])] > I_p_t_high) {
-                    int count = 1;
+            bool corner = false;
+            for (int s = 0; s < 16 && !corner; ++s) {
+                if (img[(y + oy[s]) * w + (x + ox[s])] > hi) {
+                    int run = 1;
                     for (int k = 1; k < FAST_MIN_CONTIG; ++k) {
-                        int idx = (start + k) & 0xF;
-                        if (image[(y + offset_y[idx]) * width + (x + offset_x[idx])] > I_p_t_high) count++;
-                        else break;
+                        const int idx = (s + k) & 0xF;
+                        if (img[(y + oy[idx]) * w + (x + ox[idx])] > hi) ++run; else break;
                     }
-                    if (count >= FAST_MIN_CONTIG) {
-                        is_corner = true;
-                        break;
-                    }
+                    if (run >= FAST_MIN_CONTIG) corner = true;
                 }
-                if (image[(y + offset_y[start]) * width + (x + offset_x[start])] < I_p_t_low) {
-                    int count = 1;
+                if (!corner && img[(y + oy[s]) * w + (x + ox[s])] < lo) {
+                    int run = 1;
                     for (int k = 1; k < FAST_MIN_CONTIG; ++k) {
-                        int idx = (start + k) & 0xF;
-                        if (image[(y + offset_y[idx]) * width + (x + offset_x[idx])] < I_p_t_low) count++;
-                        else break;
+                        const int idx = (s + k) & 0xF;
+                        if (img[(y + oy[idx]) * w + (x + ox[idx])] < lo) ++run; else break;
                     }
-                    if (count >= FAST_MIN_CONTIG) {
-                        is_corner = true;
-                        break;
-                    }
+                    if (run >= FAST_MIN_CONTIG) corner = true;
                 }
             }
-            if (!is_corner) {
-                continue;
-            }
+            if (!corner) continue;
 
             int score = 0;
             for (int i = 0; i < 16; ++i) {
-                int neighbor_val = image[(y + offset_y[i]) * width + (x + offset_x[i])];
-                int diff = neighbor_val - I_p;
-                if (diff < 0) diff = -diff;
-                score += diff;
+                const int v = img[(y + oy[i]) * w + (x + ox[i])];
+                score += (v > p) ? (v - p) : (p - v);
             }
-
-            if (num_kp < MAX_KEYPOINTS) {
-                keypoints[num_kp].x = x;
-                keypoints[num_kp].y = y;
-                keypoints[num_kp].score = (uint16_t)(score & 0xFFFF);
-                num_kp++;
-            }
+            score_grid[yw + x] = (uint16_t)((score > 0xFFFF) ? 0xFFFF : score);
         }
     }
 
-    if (num_kp > 1) {
-        qsort(keypoints, num_kp, sizeof(Keypoint), compare_keypoints_desc);
-    }
-    
-    memset(suppressed_arr, 0, num_kp * sizeof(bool));
-    for (int i = 0; i < num_kp; ++i) {
-        if (suppressed_arr[i]) continue;
-        for (int j = i + 1; j < num_kp; ++j) {
-            if (suppressed_arr[j]) continue;
-            int dx = keypoints[j].x - keypoints[i].x;
-            int dy = keypoints[j].y - keypoints[i].y;
-            if (dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1) {
-                suppressed_arr[j] = true;
+    // NMS (3x3 local max)
+    int keep = 0;
+    for (int y = 3; y < h - 3; ++y) {
+        const int yw = y * w;
+        for (int x = 3; x < w - 3; ++x) {
+            const uint16_t s = score_grid[yw + x];
+            if (!s) continue;
+            if (s > score_grid[yw - w + x - 1] && s > score_grid[yw - w + x] && s > score_grid[yw - w + x + 1] &&
+                s > score_grid[yw     + x - 1] &&                                  s > score_grid[yw     + x + 1] &&
+                s > score_grid[yw + w + x - 1] && s > score_grid[yw + w + x] && s > score_grid[yw + w + x + 1]) {
+                if (keep < MAX_KEYPOINTS) {
+                    keypoints[keep++] = (Keypoint){ (uint16_t)x, (uint16_t)y, s };
+                }
             }
         }
     }
-    
-    int new_count = 0;
-    for (int i = 0; i < num_kp; ++i) {
-        if (!suppressed_arr[i]) {
-            keypoints[new_count++] = keypoints[i];
-        }
-    }
-    num_kp = new_count;
-
-    ESP_LOGI(TAG_FAST, "Detected %d keypoints", num_kp);
-    *out_num_kp = num_kp;
+    *out_count = keep;
 }
 
-/**
- * @brief Initialize the camera and allocate PSRAM buffer
- */
-static esp_err_t camera_init() {
-    camera_config_t cam_config;
-    cam_config.pin_pwdn  = CAM_PIN_PWDN;
-    cam_config.pin_reset = CAM_PIN_RESET;
-    cam_config.pin_xclk  = CAM_PIN_XCLK;
-    cam_config.pin_sscb_sda = CAM_PIN_SIOD;
-    cam_config.pin_sscb_scl = CAM_PIN_SIOC;
-    cam_config.pin_d7 = CAM_PIN_D7;
-    cam_config.pin_d6 = CAM_PIN_D6;
-    cam_config.pin_d5 = CAM_PIN_D5;
-    cam_config.pin_d4 = CAM_PIN_D4;
-    cam_config.pin_d3 = CAM_PIN_D3;
-    cam_config.pin_d2 = CAM_PIN_D2;
-    cam_config.pin_d1 = CAM_PIN_D1;
-    cam_config.pin_d0 = CAM_PIN_D0;
-    cam_config.pin_vsync = CAM_PIN_VSYNC;
-    cam_config.pin_href  = CAM_PIN_HREF;
-    cam_config.pin_pclk  = CAM_PIN_PCLK;
-    cam_config.xclk_freq_hz = 20000000;
-    cam_config.ledc_timer   = LEDC_TIMER_0;
-    cam_config.ledc_channel = LEDC_CHANNEL_0;
-    cam_config.pixel_format = PIXFORMAT_YUV422; // Must use raw format for processing
-    cam_config.frame_size   = FRAMESIZE_QVGA;   // 320x240
-    cam_config.jpeg_quality = 12; // Irrelevant for YUV, but set low
-    cam_config.fb_count     = 2;
-    cam_config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+// ==================== Camera init ====================
+static esp_err_t camera_init_gray(void) {
+    camera_config_t cfg = {
+        .pin_pwdn     = CAM_PIN_PWDN,
+        .pin_reset    = CAM_PIN_RESET,
+        .pin_xclk     = CAM_PIN_XCLK,
+        .pin_sccb_sda = CAM_PIN_SIOD,
+        .pin_sccb_scl = CAM_PIN_SIOC,
+        .pin_d7 = CAM_PIN_D7, .pin_d6 = CAM_PIN_D6, .pin_d5 = CAM_PIN_D5, .pin_d4 = CAM_PIN_D4,
+        .pin_d3 = CAM_PIN_D3, .pin_d2 = CAM_PIN_D2, .pin_d1 = CAM_PIN_D1, .pin_d0 = CAM_PIN_D0,
+        .pin_vsync = CAM_PIN_VSYNC, .pin_href = CAM_PIN_HREF, .pin_pclk = CAM_PIN_PCLK,
+        .xclk_freq_hz = 20000000,
+        .ledc_timer   = LEDC_TIMER_0,
+        .ledc_channel = LEDC_CHANNEL_0,
+        .pixel_format = PIXFORMAT_GRAYSCALE,
+        .frame_size   = FRAMESIZE_QVGA,
+        .jpeg_quality = 12,
+        .fb_count     = 2,
+        .fb_location  = CAMERA_FB_IN_PSRAM,
+        .grab_mode    = CAMERA_GRAB_WHEN_EMPTY
+    };
 
-    esp_err_t err = esp_camera_init(&cam_config);
+    // (Replace ESP_RETURN_ON_ERROR) -> explicit check:
+    esp_err_t err = esp_camera_init(&cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG_CAM, "Camera init failed with error 0x%x", err);
+        ESP_LOGE(TAG, "camera init failed: 0x%x", err);
         return err;
     }
 
-    // OV3660 grayscale special effect workaround
-    sensor_t *sensor = esp_camera_sensor_get();
-    if (sensor) {
-        sensor->set_special_effect(sensor, 2); // 2 = Grayscale effect
-        ESP_LOGI(TAG_CAM, "Sensor special effect set to grayscale");
-    }
-
-    // Get frame dimensions
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        ESP_LOGE(TAG_CAM, "Camera capture failed on first frame");
-        return ESP_FAIL;
-    }
-    img_width  = fb->width;
-    img_height = fb->height;
-    size_t img_size = img_width * img_height;
-    esp_camera_fb_return(fb); // return the test frame
+    if (!fb) return ESP_FAIL;
+    g_w = fb->width; g_h = fb->height;
+    esp_camera_fb_return(fb);
 
-    // *** MEMORY FIX ***
-    // Allocate the grayscale buffer in PSRAM
-    gray_buf = heap_caps_malloc(img_size, MALLOC_CAP_SPIRAM);
-    if (!gray_buf) {
-        ESP_LOGE(TAG_CAM, "Failed to allocate grayscale image buffer in PSRAM");
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG_CAM, "Grayscale buffer (%.1f KB) allocated in PSRAM", img_size / 1024.0);
-    
+    // Allocate score grid in PSRAM
+    score_grid = heap_caps_calloc(g_w * g_h, sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    if (!score_grid) return ESP_ERR_NO_MEM;
+
+    // Optional: lock exposure/gain for stability
+    // sensor_t *s = esp_camera_sensor_get();
+    // if (s) { s->set_ae_ctrl(s, 0); s->set_agc_ctrl(s, 0); /* s->set_aec_value(s, 300); */ }
+
+    ESP_LOGI(TAG, "Cam: %dx%d GRAYSCALE, score grid OK", g_w, g_h);
     return ESP_OK;
 }
 
-/**
- * @brief HTTP handler for the MJPEG stream
- * This is now the main processing loop.
- */
-static esp_err_t stream_handler(httpd_req_t *req) {
-    camera_fb_t *fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t jpg_len = 0;
-    uint8_t *jpg_buf = NULL;
-    char *part_buf[64];
+// ========================= HTTP server =========================
+static const char INDEX_HTML[] =
+"<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>ESP32-CAM FAST</title>"
+"<style>body{font-family:system-ui;margin:0;padding:1rem;background:#111;color:#eee}img{max-width:100%}</style>"
+"</head><body><h2>ESP32-CAM FAST (STA→AP)</h2>"
+"<p>Use /stream?t=40&q=60 to tune threshold and JPEG quality.</p>"
+"<img src='/stream' alt='stream'>"
+"<p><a href='/jpg' target='_blank'>Open snapshot</a></p></body></html>";
 
-    // Set HTTP headers for MJPEG stream
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if (res != ESP_OK) {
-        return res;
+static esp_err_t root_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t jpg_get_handler(httpd_req_t *req) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { httpd_resp_send_500(req); return ESP_FAIL; }
+
+    int n_kp = 0;
+    uint8_t *jpg = NULL; size_t jpg_len = 0;
+
+    fast_detect_and_nms(fb->buf, fb->width, fb->height, &n_kp);
+    draw_keypoints_gray(fb, keypoints, n_kp);
+
+    if (!frame2jpg(fb, 80, &jpg, &jpg_len)) { // higher quality snapshot
+        esp_camera_fb_return(fb); httpd_resp_send_500(req); return ESP_FAIL;
     }
 
-    while (true) {
-        int num_kp = 0;
-        
-        // 1. Capture a frame
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG_CAM, "Camera capture failed");
-            res = ESP_FAIL;
-            break;
-        }
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    esp_err_t res = httpd_resp_send(req, (const char*)jpg, jpg_len);
 
-        // 2. Extract luminance (Y) channel into grayscale buffer
-        extract_grayscale(fb);
-
-        // 3. Run FAST corner detection and NMS on the grayscale buffer
-        run_fast_and_nms(&num_kp);
-
-        // 4. Draw the final keypoints onto the YUV frame
-        draw_keypoints(fb, keypoints, num_kp);
-
-        // 5. Convert the modified YUV frame to JPEG
-        // This is slow (software encoding) and is the main bottleneck!
-        res = frame2jpg(fb, 80, &jpg_buf, &jpg_len);
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG_CAM, "JPEG conversion failed");
-            esp_camera_fb_return(fb);
-            break;
-        }
-
-        // 6. Send the MJPEG frame header
-        size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, jpg_len);
-        res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        if (res != ESP_OK) {
-            break; // Client disconnected
-        }
-
-        // 7. Send the JPEG image data
-        res = httpd_resp_send_chunk(req, (const char *)jpg_buf, jpg_len);
-        if (res != ESP_OK) {
-            break; // Client disconnected
-        }
-
-        // 8. Send the MJPEG frame boundary
-        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        if (res != ESP_OK) {
-            break; // Client disconnected
-        }
-
-        // 9. Cleanup
-        free(jpg_buf);
-        jpg_buf = NULL;
-        esp_camera_fb_return(fb);
-
-        // Yield to other tasks (optional, but good practice)
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    // Cleanup if loop breaks
-    if (jpg_buf) {
-        free(jpg_buf);
-    }
+    free(jpg); esp_camera_fb_return(fb);
     return res;
 }
 
-/**
- * @brief Basic HTTP handler for the main page (/)
- */
-static esp_err_t index_handler(httpd_req_t *req) {
-    char* resp_str = "<html><head><title>ESP32-CAM FAST</title></head>"
-                      "<body><h1>ESP32-CAM FAST Detector</h1>"
-                      "<p>View the processed stream at /stream</p>"
-                      // Embed the stream directly
-                      "<img src=\"/stream\" width=\"320\" height=\"240\">"
-                      "</body></html>";
-    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+static esp_err_t stream_get_handler(httpd_req_t *req) {
+    // Parse ?t= and ?q=
+    char qstr[64];
+    if (httpd_req_get_url_query_str(req, qstr, sizeof(qstr)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(qstr, "t", val, sizeof(val)) == ESP_OK) {
+            int t = atoi(val); if (t >= 5 && t <= 120) g_fast_threshold = t;
+        }
+    }
+    int jpeg_q = 60; // default stream JPEG quality
+    if (httpd_req_get_url_query_str(req, qstr, sizeof(qstr)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(qstr, "q", val, sizeof(val)) == ESP_OK) {
+            int q = atoi(val); if (q >= 5 && q <= 95) jpeg_q = q;
+        }
+    }
+
+    httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+
+    camera_fb_t *fb = NULL;
+    uint8_t *jpg = NULL; size_t jpg_len = 0;
+    char part_buf[64];
+
+    // FPS logger
+    uint32_t frames = 0;
+    int64_t t0 = esp_timer_get_time();
+
+    while (true) {
+        int n_kp = 0;
+
+        fb = esp_camera_fb_get();
+        if (!fb) { ESP_LOGE(TAG, "fb_get NULL"); break; }
+
+        fast_detect_and_nms(fb->buf, fb->width, fb->height, &n_kp);
+        draw_keypoints_gray(fb, keypoints, n_kp);
+
+        if (!frame2jpg(fb, jpeg_q, &jpg, &jpg_len)) {
+            ESP_LOGE(TAG, "frame2jpg failed");
+            esp_camera_fb_return(fb); break;
+        }
+
+        if (httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY)) != ESP_OK) { free(jpg); esp_camera_fb_return(fb); break; }
+        int hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART_HDR, (unsigned)jpg_len);
+        if (httpd_resp_send_chunk(req, part_buf, hlen) != ESP_OK) { free(jpg); esp_camera_fb_return(fb); break; }
+        if (httpd_resp_send_chunk(req, (const char *)jpg, jpg_len) != ESP_OK) { free(jpg); esp_camera_fb_return(fb); break; }
+
+        free(jpg); jpg = NULL; esp_camera_fb_return(fb);
+
+        frames++;
+        int64_t dt = esp_timer_get_time() - t0;
+        if (dt >= 1000000) {
+            ESP_LOGI(TAG, "FPS ~ %.1f  (t=%d q=%d)", (double)frames * 1e6 / dt, g_fast_threshold, jpeg_q);
+            frames = 0; t0 = esp_timer_get_time();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+
+    if (jpg) free(jpg);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
-/**
- * @brief Starts the web server
- */
 static httpd_handle_t start_webserver(void) {
-    httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.uri_match_fn = httpd_uri_match_wildcard;
     config.lru_purge_enable = true;
 
-    // URI handler for the index page
-    httpd_uri_t index_uri = {
-        .uri       = "/",
-        .method    = HTTP_GET,
-        .handler   = index_handler,
-        .user_ctx  = NULL
-    };
-
-    // URI handler for the MJPEG stream
-    httpd_uri_t stream_uri = {
-        .uri       = "/stream",
-        .method    = HTTP_GET,
-        .handler   = stream_handler,
-        .user_ctx  = NULL
-    };
-
-    ESP_LOGI(TAG_SRV, "Starting server on port: '%d'", config.server_port);
+    httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_register_uri_handler(server, &index_uri);
-        httpd_register_uri_handler(server, &stream_uri);
-        return server;
+        httpd_uri_t u_root   = { .uri="/",       .method=HTTP_GET, .handler=root_get_handler   };
+        httpd_uri_t u_jpg    = { .uri="/jpg",    .method=HTTP_GET, .handler=jpg_get_handler    };
+        httpd_uri_t u_stream = { .uri="/stream", .method=HTTP_GET, .handler=stream_get_handler };
+        httpd_register_uri_handler(server, &u_root);
+        httpd_register_uri_handler(server, &u_jpg);
+        httpd_register_uri_handler(server, &u_stream);
+        ESP_LOGI(TAG, "HTTP server started");
     }
-
-    ESP_LOGI(TAG_SRV, "Error starting server!");
-    return NULL;
+    return server;
 }
 
-/**
- * @brief Event handler for Wi-Fi events
- */
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                               int32_t event_id, void* event_data) {
-    if (event_id == WIFI_EVENT_STA_START) {
+// ============================ Wi-Fi (STA + fallback AP) =========================
+static void wifi_evt_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGI(TAG_WIFI, "connect to the AP fail");
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "STA disconnected, retrying…");
         esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG_WIFI, "--------------------------------------------------");
-        ESP_LOGI(TAG_WIFI, "Wi-Fi Connected!");
-        ESP_LOGI(TAG_WIFI, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG_WIFI, "Open http://" IPSTR "/ in your browser", IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG_WIFI, "--------------------------------------------------");
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "STA Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-/**
- * @brief Initialize Wi-Fi in Station mode
- */
-static void wifi_init_sta(void) {
+static bool wifi_try_sta(uint32_t wait_ms) {
+    s_wifi_event_group = xEventGroupCreate();
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+
+    wifi_country_t country = { .cc="US", .schan=1, .nchan=11, .policy=WIFI_COUNTRY_POLICY_AUTO };
+    esp_wifi_set_country(&country);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_evt_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_evt_handler, NULL, NULL));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_config_t sta_cfg = { 0 };
+    strncpy((char*)sta_cfg.sta.ssid, WIFI_SSID, sizeof(sta_cfg.sta.ssid));
+    strncpy((char*)sta_cfg.sta.password, WIFI_PASS, sizeof(sta_cfg.sta.password));
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.required   = false;
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(wait_ms));
+    return (bits & WIFI_CONNECTED_BIT) != 0;
+}
+
+static void wifi_start_softap(void) {
+    ESP_LOGW(TAG, "Starting SoftAP…");
+    esp_wifi_stop();
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+
+    static bool ap_created = false;
+    if (!ap_created) {
+        (void)esp_netif_create_default_wifi_ap();  // create AP netif; ignore handle
+        ap_created = true;
+    }
+
+    wifi_config_t apcfg = { 0 };
+    uint8_t mac[6] = {0};
+    esp_wifi_get_mac(WIFI_IF_AP, mac);
+    char ssid[32]; snprintf(ssid, sizeof(ssid), "ESP32-CAM-%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+    strncpy((char*)apcfg.ap.ssid, ssid, sizeof(apcfg.ap.ssid));
+    strncpy((char*)apcfg.ap.password, "12345678", sizeof(apcfg.ap.password));
+    apcfg.ap.ssid_len       = strlen((char*)apcfg.ap.ssid);
+    apcfg.ap.authmode       = WIFI_AUTH_WPA_WPA2_PSK;   // set WIFI_AUTH_OPEN for no password
+    apcfg.ap.channel        = 6;
+    apcfg.ap.max_connection = 2;
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &apcfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGW(TAG, "SoftAP SSID: %s  PASS: 12345678  IP: 192.168.4.1", (char*)apcfg.ap.ssid);
+}
+
+// ============================== MAIN ==============================
+void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_sta(); // STA netif now; AP netif later if needed
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(camera_init_gray());
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
+    bool sta_ok = wifi_try_sta(10000);   // ~10 s
+    if (!sta_ok) wifi_start_softap();
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASS,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
-
-    ESP_LOGI(TAG_WIFI, "wifi_init_sta finished. Connecting to %s...", WIFI_SSID);
-}
-
-void app_main(void) {
-    // Initialize NVS (required for Wi-Fi)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-      ESP_ERROR_CHECK(nvs_flash_erase());
-      ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Initialize camera and PSRAM buffer
-    ESP_ERROR_CHECK(camera_init());
-
-    // Initialize Wi-Fi
-    wifi_init_sta();
-
-    // Start the web server
     start_webserver();
 
-    // app_main can now exit; the server and its handler run in their own tasks
-    ESP_LOGI("MAIN", "Initialization complete. Server is running.");
+    if (sta_ok) ESP_LOGI(TAG, "Open: http://<router-IP>/");
+    else        ESP_LOGI(TAG, "Open: http://192.168.4.1/");
 }
