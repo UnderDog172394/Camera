@@ -1,8 +1,10 @@
-// ESP32-CAM (Ai-Thinker) FAST-12 + Census(9x9)/Hamming tracker
-// Fixed-abs Hamming gate + ratio-or-margin accept, gentle low-texture governor,
-// reseed throttle (no skipping), per-frame search radius, easier FB check.
+// ESP32-CAM (Ai-Thinker) FAST-12 + Census(9x9)/Hamming tracker + Sim2 RANSAC (PQ)
+// - RANSAC runs on real point pairs P->Q gathered from accepted matches
+// - Mild rotation clamp with hysteresis
+// - Reseed hygiene when crowded & low texture
+// - Optional pixels→inches logging
 //
-// Build: QVGA GRAYSCALE, fb_count=2, PSRAM required.
+// Build: QVGA GRAYSCALE, fb_count=2, PSRAM required. ESP-IDF v4+.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,11 +21,24 @@
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 
 // ----------------------------- TOGGLES --------------------------------------
 #define AUTO_EXPO_SWEEP        1
 #define LOCK_AE_AFTER_SWEEP    1
 #define USE_BRIEF              0     // 0=Census-9x9, 1=BRIEF-128 (pairs stubbed)
+
+// --- NEW toggles -------------------------------------------------------------
+#define LOG_INCHES             0     // 1: also print cum in inches using PX_PER_IN
+#define PX_PER_IN              33.0f // adjust per setup if LOG_INCHES=1
+
+#define RANSAC_TRIM_Q25        1     // drop worst 25% by Hamming before RANSAC
+#define ROT_CLAMP_DEG          20.0f // clamp absurd rotations unless better inliers
+#define ROT_IMPROVE_MIN        0.10f // inlier fraction must improve by >0.10 to accept big θ
+#define RESEED_HYGIENE_ON      1
+#define RH_ALIVE_MIN           50    // if alive > this and texture low:
+#define RH_TEX_MAX             16    // cap reseeds to 2 for RH_FRAMES frames
+#define RH_FRAMES              2
 
 // FAST scan stride & grid NMS
 #ifndef FAST_STRIDE
@@ -419,6 +434,7 @@ static inline int frame_texture_score(const uint8_t* img, int w, int h){
     return (cnt>0)? (sum/cnt) : 0;
 }
 static inline int clampi(int v,int lo,int hi){ return v<lo?lo:(v>hi?hi:v); }
+static inline float clampf(float v,float lo,float hi){ return v<lo?lo:(v>hi?hi:v); }
 
 // -------------------------- Tracker core ------------------------------------
 static void tracker_reset(void){
@@ -454,7 +470,6 @@ static int tracker_seed_from_fast(const Keypoint* kps, int n, const uint8_t* img
         build_census9x9(img, g_w, g_h, t.x, t.y, t.desc);
     #endif
 
-        // place in first free slot or append
         int slot = -1;
         for (int j=0;j<g_ntracks;j++) if (!g_tracks[j].alive){ slot=j; break; }
         if (slot>=0) g_tracks[slot]=t;
@@ -479,7 +494,7 @@ static void tracker_compact(void){
     g_ntracks = w;
 }
 
-// Windowed Hamming matcher (prev->curr) with motion prior
+// --- Match + FB --------------------------------------------------------------
 static bool match_window_hamming(const uint8_t* prev, const uint8_t* curr, const Track* trk,
                                  int *mx, int *my, int *best_cost, int *second_cost, int ham_gate)
 {
@@ -505,16 +520,12 @@ static bool match_window_hamming(const uint8_t* prev, const uint8_t* curr, const
 
     *mx = bx; *my = by; *best_cost = best; *second_cost = second;
 
-    // Fixed absolute gate
     if (best > ham_gate) return false;
-
-    // ratio OR margin rule
     bool ratio_ok  = (second <= 0) || (best*100 <= 85*second);
     bool margin_ok = ((second - best) >= HAM_MARGIN_MIN);
     return (ratio_ok || margin_ok);
 }
 
-// FB check (curr -> prev) using small window around curr
 static bool fb_check(const uint8_t* prev, const uint8_t* curr, int x_prev, int y_prev, int x_curr, int y_curr, int ham_gate)
 {
 #if USE_BRIEF
@@ -527,16 +538,17 @@ static bool fb_check(const uint8_t* prev, const uint8_t* curr, int x_prev, int y
     for (int dy=-g_win_rad; dy<=g_win_rad; ++dy){
         int y = y_curr + dy; if (y<SEED_BORDER || y>=g_h-SEED_BORDER) continue;
         for (int dx=-g_win_rad; dx<=g_win_rad; ++dx){
-            int x = x_curr + dx;
-            if (x<SEED_BORDER || x>=g_w-SEED_BORDER) continue;
+            int x = y_curr + dx; (void)x; // quiet analyzer (x recomputed below)
+            int xx = x_curr + dx;
+            if (xx<SEED_BORDER || xx>=g_w-SEED_BORDER) continue;
         #if USE_BRIEF
-            uint32_t dprev[4]; build_brief128(prev, g_w, g_h, x, y, dprev);
+            uint32_t dprev[4]; build_brief128(prev, g_w, g_h, xx, y, dprev);
             int cost = ham128(dcur, dprev);
         #else
-            uint32_t dprev[3]; build_census9x9(prev, g_w, g_h, x, y, dprev);
+            uint32_t dprev[3]; build_census9x9(prev, g_w, g_h, xx, y, dprev);
             int cost = ham96(dcur, dprev);
         #endif
-            if (cost < best){ best = cost; bx = x; by = y; }
+            if (cost < best){ best = cost; bx = xx; by = y; }
         }
     }
 
@@ -544,6 +556,12 @@ static bool fb_check(const uint8_t* prev, const uint8_t* curr, int x_prev, int y
     if (best > ham_gate) return false;
     return (dx*dx + dy*dy) <= (FB_THR_PX*FB_THR_PX);
 }
+
+// --------- Match buffer for Sim2 (accepted pairs + costs) -------------------
+#define MATCH_BUF 256
+static int16_t g_px[MATCH_BUF], g_py[MATCH_BUF], g_qx[MATCH_BUF], g_qy[MATCH_BUF];
+static uint8_t g_cost[MATCH_BUF];
+static int g_mcount = 0;
 
 // Update all tracks; returns alive count and fills debug stats
 typedef struct {
@@ -554,12 +572,36 @@ typedef struct {
     int reseeded;
     int ham_sum, ham_min, ham_max;
     int best2_sum; // second-best accumulator
+    // per-frame robust median stats for logging
+    float med_dx, med_dy, med_abs_dx, med_abs_dy;
 } TrkStats;
+
+// helpers for medians
+static int cmp_int(const void* a, const void* b){
+    const int ai = *(const int*)a, bi = *(const int*)b;
+    return (ai>bi) - (ai<bi);
+}
+static float median_of_ints(const int *a, int n){
+    if (n<=0) return 0.f;
+    int *tmp = (int*)alloca(n*sizeof(int));
+    for (int i=0;i<n;i++) tmp[i] = a[i];
+    qsort(tmp, n, sizeof(int), cmp_int);
+    return (n & 1) ? (float)tmp[n/2] : 0.5f*(tmp[n/2 - 1] + tmp[n/2]);
+}
+static float median_of_abs(const int *a, int n){
+    if (n<=0) return 0.f;
+    int *tmp = (int*)alloca(n*sizeof(int));
+    for (int i=0;i<n;i++){ int v=a[i]; tmp[i]= v<0?-v:v; }
+    qsort(tmp, n, sizeof(int), cmp_int);
+    return (n & 1) ? (float)tmp[n/2] : 0.5f*(tmp[n/2 - 1] + tmp[n/2]);
+}
 
 static int tracker_update(const uint8_t* prev, const uint8_t* curr, TrkStats* ts, int ham_gate)
 {
     memset(ts, 0, sizeof(*ts));
     ts->ham_min = 9999;
+
+    int dxs[MAX_TRACKS], dys[MAX_TRACKS]; int nd=0;
 
     for (int i=0;i<g_ntracks;i++){
         Track *t = &g_tracks[i];
@@ -598,6 +640,18 @@ static int tracker_update(const uint8_t* prev, const uint8_t* curr, TrkStats* ts
         ts->best2_sum += (second>0?second:0);
         if (best < ts->ham_min) ts->ham_min = best;
         if (best > ts->ham_max) ts->ham_max = best;
+
+        if (nd < MAX_TRACKS){ dxs[nd]=dx; dys[nd]=dy; nd++; }
+
+        // --- stash pair for Sim2 -------------
+        if (g_mcount < MATCH_BUF){
+            g_px[g_mcount]   = (int16_t)(t->x - dx);
+            g_py[g_mcount]   = (int16_t)(t->y - dy);
+            g_qx[g_mcount]   = (int16_t)(t->x);
+            g_qy[g_mcount]   = (int16_t)(t->y);
+            g_cost[g_mcount] = (uint8_t)clampi(best,0,255);
+            g_mcount++;
+        }
     }
 
     // Compact + soft cap on alive tracks
@@ -611,7 +665,94 @@ static int tracker_update(const uint8_t* prev, const uint8_t* curr, TrkStats* ts
     }
     ts->alive = alive;
     tracker_compact();
+
+    // robust medians for logging
+    ts->med_dx     = (nd>0)? median_of_ints(dxs, nd)    : 0.f;
+    ts->med_dy     = (nd>0)? median_of_ints(dys, nd)    : 0.f;
+    ts->med_abs_dx = (nd>0)? median_of_abs(dxs, nd)     : 0.f;
+    ts->med_abs_dy = (nd>0)? median_of_abs(dys, nd)     : 0.f;
+
     return ts->alive;
+}
+
+// ========================= Sim2 from point pairs (RANSAC) ===================
+typedef struct { float s, theta, tx, ty; float inlier_frac; float rmse; } Sim2Fit;
+
+static inline void sim2_from_2pts(float x1,float y1,float x2,float y2,
+                                  float X1,float Y1,float X2,float Y2,
+                                  float* s,float* th,float* tx,float* ty)
+{
+    float dxp = x2-x1, dyp = y2-y1;
+    float dxq = X2-X1, dyq = Y2-Y1;
+    float rp = sqrtf(dxp*dxp + dyp*dyp) + 1e-6f;
+    float rq = sqrtf(dxq*dxq + dyq*dyq) + 1e-6f;
+    float scale = rq/rp;
+    float angp = atan2f(dyp, dxp);
+    float angq = atan2f(dyq, dxq);
+    float theta = angq - angp;
+    float c = cosf(theta), si = sinf(theta);
+    float tx0 = X1 - scale*(c*x1 - si*y1);
+    float ty0 = Y1 - scale*(si*x1 + c*y1);
+    *s = scale; *th = theta; *tx = tx0; *ty = ty0;
+}
+
+static Sim2Fit sim2_ransac_PQ(const int16_t *px,const int16_t *py,
+                               const int16_t *qx,const int16_t *qy,
+                               const uint8_t *cost, int N, float eps_px,
+                               Sim2Fit prev)
+{
+    Sim2Fit best={.s=1.f,.theta=0.f,.tx=0.f,.ty=0.f,.inlier_frac=-1.f,.rmse=0.f};
+    if (N<4) return best;
+
+    // optional trim by cost (keep best 75%)
+#if RANSAC_TRIM_Q25
+    static uint8_t tmpc[MATCH_BUF];
+    for (int i=0;i<N;i++) tmpc[i] = cost[i];
+    // sort copy to find cutoff
+    for (int i=0;i<N-1;i++) for (int j=i+1;j<N;j++) if (tmpc[j]<tmpc[i]) { uint8_t t=tmpc[i]; tmpc[i]=tmpc[j]; tmpc[j]=t; }
+    uint8_t cutoff = tmpc[(3*N)/4];
+#endif
+
+    const int iters = 64;
+    for (int it=0; it<iters; ++it){
+        // sample two distinct indices
+        int i1 = esp_random() % N, i2 = esp_random() % N; if (i2==i1) i2 = (i1+1)%N;
+
+#if RANSAC_TRIM_Q25
+        if (cost[i1]>cutoff || cost[i2]>cutoff) continue;
+#endif
+
+        float s,th,tx,ty;
+        sim2_from_2pts(px[i1],py[i1], px[i2],py[i2], qx[i1],qy[i1], qx[i2],qy[i2], &s,&th,&tx,&ty);
+
+        float c=cosf(th), si=sinf(th);
+        int inl=0; double se2=0.0;
+        for (int k=0;k<N;k++){
+#if RANSAC_TRIM_Q25
+            if (cost[k]>cutoff) continue;
+#endif
+            float xp = s*(c*px[k] - si*py[k]) + tx;
+            float yp = s*(si*px[k] + c*py[k]) + ty;
+            float ex = xp - qx[k];
+            float ey = yp - qy[k];
+            float e2 = ex*ex + ey*ey;
+            if (e2 <= eps_px*eps_px){ inl++; se2 += e2; }
+        }
+        float frac = (float)inl / (float)N;
+        if (frac > best.inlier_frac){
+            best.s=s; best.theta=th; best.tx=tx; best.ty=ty;
+            best.inlier_frac = frac;
+            best.rmse = (inl>0)? sqrtf((float)(se2/(double)inl)) : 0.f;
+        }
+    }
+
+    // rotation clamp with hysteresis
+    if (fabsf(best.theta)*(180.0f/(float)M_PI) > ROT_CLAMP_DEG &&
+        !(best.inlier_frac > prev.inlier_frac + ROT_IMPROVE_MIN))
+    {
+        best.theta = prev.theta; // keep previous rotation
+    }
+    return best;
 }
 
 // ------------------------------- APP MAIN -----------------------------------
@@ -628,6 +769,13 @@ void app_main(void)
     tracker_reset();
 
     uint32_t frames=0; int64_t t0=esp_timer_get_time();
+
+    // motion accumulators for log
+    float cum_dx=0.f, cum_dy=0.f;
+    // reseed hygiene cooldown
+    int rh_cool=0;
+    // previous Sim2 for hysteresis
+    Sim2Fit prev_fit = {.s=1.f,.theta=0.f,.tx=0.f,.ty=0.f,.inlier_frac=-1.f,.rmse=0.f};
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -653,6 +801,14 @@ void app_main(void)
                 g_last_fast_cnt = n_kp;
 
                 int cap  = lowtex ? RESEED_CAP_LOW : RESEED_CAP_PERF;
+
+#if RESEED_HYGIENE_ON
+                if (alive_now > RH_ALIVE_MIN && tex < RH_TEX_MAX){
+                    cap = (cap>2)?2:cap;
+                    rh_cool = RH_FRAMES;            // keep cap for a couple frames
+                }
+                if (rh_cool>0){ cap = (cap>2)?2:cap; rh_cool--; }
+#endif
                 int want = TARGET_TRACKS - alive_now;
                 if (want > cap) want = cap;
 
@@ -668,7 +824,11 @@ void app_main(void)
         int alive_now = tracker_update(g_prev, fb->buf, &ts, ham_gate);
         ts.reseeded = reseeded;
 
-        // Once-per-second stats
+        // update cumulative from robust medians
+        cum_dx += ts.med_dx;
+        cum_dy += ts.med_dy;
+
+        // Once-per-second stats (+ Sim2 RANSAC on P,Q pairs)
         frames++;
         int64_t now = esp_timer_get_time();
         float dt_s = (now - t0)*1e-6f;
@@ -678,19 +838,55 @@ void app_main(void)
             int ham_avg = (ts.matched>0) ? (ts.ham_sum/ts.matched) : -1;
             int best2_avg = (ts.matched>0 && ts.best2_sum>0) ? (ts.best2_sum/ts.matched) : (ts.matched?0:-1);
 
-            char fast_buf[12]; const char *fast_str = "--";
-            const char *fast_field = fast_str;
+            // Sim2 from gathered matches
+            Sim2Fit fit = {.s=1.f,.theta=0.f,.tx=0.f,.ty=0.f,.inlier_frac=-1.f,.rmse=0.f};
+            if (g_mcount >= 4){
+                // eps based on current motion estimate
+                float m = fabsf(ts.med_abs_dx) > fabsf(ts.med_abs_dy) ? ts.med_abs_dx : ts.med_abs_dy;
+                float eps = clampf(0.6f + 0.3f*m, 0.8f, 2.0f); // 0.8..2.0 px
+                fit = sim2_ransac_PQ(g_px,g_py,g_qx,g_qy,g_cost,g_mcount, eps, prev_fit);
+                prev_fit = fit;
+            }
+            float th_deg = fit.theta * (180.0f/(float)M_PI);
+
+            char fast_buf[12]; const char *fast_field = "--";
             if (g_last_fast_cnt >= 0){ snprintf(fast_buf,sizeof(fast_buf),"%d", g_last_fast_cnt); fast_field = fast_buf; }
 
+#if LOG_INCHES
+            float cum_dx_in = -cum_dx / PX_PER_IN;
+            float cum_dy_in = -cum_dy / PX_PER_IN;
             ESP_LOGI(TAG,
-                "FPS=%.1f  FAST=%s  Tracks: alive=%d, matched=%d, reseeded=%d, "
-                "rej_ham=%d, rej_fb=%d, ham[min/avg/max]=[%d/%d/%d], 2nd_best_avg=%d, tex=%d, sr=%d",
+                "FPS=%.1f FAST=%s Tracks: alive=%d, matched=%d, reseeded=%d, "
+                "rej_ham=%d, rej_fb=%d, ham[min/avg/max]=[%d/%d/%d], 2nd_best_avg=%d, tex=%d, sr=%d | "
+                "Model=%s inlier=%.2f s=%.3f th=%.2fdeg t=(%.2f,%.2f) rmse=%.3f | "
+                "med(dx,dy)=%.1f,%.1f medAbs=%.1f,%.1f cum=(%.1f,%.1f)px ≈ (%.2f,%.2f)in",
                 fps, fast_field, alive_now, ts.matched, ts.reseeded,
                 ts.lost_ham, ts.lost_fb,
                 (ts.matched?ts.ham_min:-1), ham_avg, (ts.matched?ts.ham_max:-1),
-                best2_avg, tex, g_win_rad);
+                best2_avg, tex, g_win_rad,
+                (fit.inlier_frac<0?"none":"Sim2"), fit.inlier_frac<0?-1.0f:fit.inlier_frac,
+                fit.s, th_deg, fit.tx, fit.ty, fit.rmse,
+                ts.med_dx, ts.med_dy, ts.med_abs_dx, ts.med_abs_dy,
+                cum_dx, cum_dy, cum_dx_in, cum_dy_in);
+#else
+            ESP_LOGI(TAG,
+                "FPS=%.1f FAST=%s Tracks: alive=%d, matched=%d, reseeded=%d, "
+                "rej_ham=%d, rej_fb=%d, ham[min/avg/max]=[%d/%d/%d], 2nd_best_avg=%d, tex=%d, sr=%d | "
+                "Model=%s inlier=%.2f s=%.3f th=%.2fdeg t=(%.2f,%.2f) rmse=%.3f | "
+                "med(dx,dy)=%.1f,%.1f medAbs=%.1f,%.1f cum=(%.1f,%.1f)",
+                fps, fast_field, alive_now, ts.matched, ts.reseeded,
+                ts.lost_ham, ts.lost_fb,
+                (ts.matched?ts.ham_min:-1), ham_avg, (ts.matched?ts.ham_max:-1),
+                best2_avg, tex, g_win_rad,
+                (fit.inlier_frac<0?"none":"Sim2"), fit.inlier_frac<0?-1.0f:fit.inlier_frac,
+                fit.s, th_deg, fit.tx, fit.ty, fit.rmse,
+                ts.med_dx, ts.med_dy, ts.med_abs_dx, ts.med_abs_dy,
+                cum_dx, cum_dy);
+#endif
 
+            // reset per-second buffers
             frames=0; t0=now; g_last_fast_cnt = -1;
+            g_mcount = 0;
         }
 
         // Roll frame (curr → prev)
